@@ -44,12 +44,12 @@ public class PreferenceConfiguration {
     private static final String TOUCHSCREEN_TRACKPAD_PREF_STRING = "checkbox_touchscreen_trackpad";
     private static final String LATENCY_TOAST_PREF_STRING = "checkbox_enable_post_stream_toast";
 
-    static final String DEFAULT_RESOLUTION = "1280x720";
-    static final String DEFAULT_FPS = "60";
+    static final String DEFAULT_RESOLUTION = "3120x1440";
+    static final String DEFAULT_FPS = "90";
     private static final boolean DEFAULT_STRETCH = false;
     private static final boolean DEFAULT_SOPS = true;
     private static final boolean DEFAULT_DISABLE_TOASTS = false;
-    private static final boolean DEFAULT_HOST_AUDIO = false;
+    private static final boolean DEFAULT_HOST_AUDIO = true;
     private static final int DEFAULT_DEADZONE = 15;
     private static final int DEFAULT_OPACITY = 90;
     public static final String DEFAULT_LANGUAGE = "default";
@@ -82,6 +82,7 @@ public class PreferenceConfiguration {
     public static final String RES_720P = "1280x720";
     public static final String RES_1080P = "1920x1080";
     public static final String RES_1440P = "2560x1440";
+    public static final String RES_OP7Pro = "3120x1440";
     public static final String RES_4K = "3840x2160";
 
     public int width, height, fps;
@@ -122,14 +123,14 @@ public class PreferenceConfiguration {
             return RES_1080P;
         }
         else if (resString.equalsIgnoreCase("1440p")) {
-            return RES_1440P;
+            return RES_OP7Pro;
         }
         else if (resString.equalsIgnoreCase("4K")) {
             return RES_4K;
         }
         else {
             // Should be unreachable
-            return RES_720P;
+            return RES_OP7Pro;
         }
     }
 
@@ -153,7 +154,8 @@ public class PreferenceConfiguration {
             case 1080:
                 return RES_1080P;
             case 1440:
-                return RES_1440P;
+                return RES_OP7Pro;
+//                return RES_1440P;
             case 2160:
                 return RES_4K;
         }

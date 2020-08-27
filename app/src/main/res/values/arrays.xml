@@ -6,6 +6,7 @@
         <item>720p</item>
         <item>1080p</item>
         <item>1440p</item>
+        <item>OP7Pro</item>
         <item>4K</item>
     </string-array>
     <string-array name="resolution_values" translatable="false">
@@ -14,6 +15,7 @@
         <item>1280x720</item>
         <item>1920x1080</item>
         <item>2560x1440</item>
+        <item>3120x1440</item>
         <item>3840x2160</item>
     </string-array>
 

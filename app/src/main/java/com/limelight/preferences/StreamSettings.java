@@ -204,7 +204,7 @@ public class StreamSettings extends Activity {
                         maxSupportedResW = 3840;
                     }
                     else if ((width >= 2560 || height >= 1440) && maxSupportedResW < 2560) {
-                        maxSupportedResW = 2560;
+                        maxSupportedResW = 3120;
                     }
                     else if ((width >= 1920 || height >= 1080) && maxSupportedResW < 1920) {
                         maxSupportedResW = 1920;
