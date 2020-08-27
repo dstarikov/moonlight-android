@@ -399,14 +399,24 @@ Java_com_limelight_nvstream_jni_MoonBridge_startConnection(JNIEnv *env, jclass c
     (*env)->ReleaseByteArrayElements(env, riAesIv, riAesIvBuf, JNI_ABORT);
 
     BridgeVideoRendererCallbacks.capabilities = videoCapabilities;
-
-    int ret = LiStartConnection(&serverInfo,
+    int ret;
+    if (videoCapabilities == -1) {
+        ret = LiStartConnection(&serverInfo,
+                                &streamConfig,
+                                &BridgeConnListenerCallbacks,
+                                &BridgeVideoRendererCallbacks,
+                                &BridgeAudioRendererCallbacks,
+                                NULL, -1,
+                                NULL, -1);
+    } else {
+        ret = LiStartConnection(&serverInfo,
                                 &streamConfig,
                                 &BridgeConnListenerCallbacks,
                                 &BridgeVideoRendererCallbacks,
                                 &BridgeAudioRendererCallbacks,
                                 NULL, 0,
                                 NULL, 0);
+    }
 
     (*env)->ReleaseStringUTFChars(env, address, serverInfo.address);
     (*env)->ReleaseStringUTFChars(env, appVersion, serverInfo.serverInfoAppVersion);

@@ -48,6 +48,8 @@ import android.content.SharedPreferences;
 import android.content.pm.ActivityInfo;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Canvas;
+import android.graphics.Color;
 import android.graphics.Point;
 import android.graphics.Rect;
 import android.hardware.input.InputManager;
@@ -70,6 +72,7 @@ import android.view.View;
 import android.view.View.OnGenericMotionListener;
 import android.view.View.OnSystemUiVisibilityChangeListener;
 import android.view.View.OnTouchListener;
+import android.view.ViewGroup;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
@@ -78,7 +81,6 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.ByteArrayInputStream;
-import java.lang.reflect.Field;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
@@ -95,6 +97,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     // Only 2 touches are supported
     private final TouchContext[] touchContextMap = new TouchContext[2];
     private long threeFingerDownTime = 0;
+    private long fourFingerDownTime = 0;
 
     private static final int REFERENCE_HORIZ_RES = 1280;
     private static final int REFERENCE_VERT_RES = 720;
@@ -106,6 +109,8 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private static final int STYLUS_UP_DEAD_ZONE_RADIUS = 50;
 
     private static final int THREE_FINGER_TAP_THRESHOLD = 300;
+    private static final int FOUR_FINGER_HOLD_MIN = 2000;
+    private static final int FOUR_FINGER_HOLD_MAX = 5000;
 
     private ControllerHandler controllerHandler;
     private VirtualController virtualController;
@@ -145,6 +150,17 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     private WifiManager.WifiLock lowLatencyWifiLock;
 
     private boolean connectedToUsbDriverService = false;
+
+    // Used for stopping/resuming audio/video streams
+    private boolean streamingToggled = true;
+    private boolean turningOffStream = false;
+    private boolean willStreamHdr;
+    private boolean aspectRatioMatch;
+    private GlPreferences glPrefs;
+    private ConnectivityManager connMgr;
+    private int chosenFrameRate;
+    private float displayRefreshRate;
+
     private ServiceConnection usbDriverServiceConnection = new ServiceConnection() {
         @Override
         public void onServiceConnected(ComponentName componentName, IBinder iBinder) {
@@ -167,6 +183,133 @@ public class Game extends Activity implements SurfaceHolder.Callback,
     public static final String EXTRA_PC_NAME = "PcName";
     public static final String EXTRA_APP_HDR = "HDR";
     public static final String EXTRA_SERVER_CERT = "ServerCert";
+
+    private void setStreamViewListeners() {
+        streamView.setOnGenericMotionListener(this);
+        streamView.setOnTouchListener(this);
+        streamView.setInputCallbacks(this);
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // The view must be focusable for pointer capture to work.
+            streamView.setFocusable(true);
+            streamView.setDefaultFocusHighlightEnabled(false);
+            streamView.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
+                @Override
+                public boolean onCapturedPointer(View view, MotionEvent motionEvent) {
+                    return handleMotionEvent(view, motionEvent);
+                }
+            });
+        }
+    }
+
+    private void setDecoderFrameDropRendering() {
+        // HACK: Despite many efforts to ensure low latency consistent frame
+        // delivery, the best non-lossy mechanism is to buffer 1 extra frame
+        // in the output pipeline. Android does some buffering on its end
+        // in SurfaceFlinger and it's difficult (impossible?) to inspect
+        // the precise state of the buffer queue to the screen after we
+        // release a frame for rendering.
+        //
+        // Since buffering a frame adds latency and we are primarily a
+        // latency-optimized client, rather than one designed for picture-perfect
+        // accuracy, we will synthetically induce a negative pressure on the display
+        // output pipeline by driving the decoder input pipeline under the speed
+        // that the display can refresh. This ensures a constant negative pressure
+        // to keep latency down but does induce a periodic frame loss. However, this
+        // periodic frame loss is *way* less than what we'd already get in Marshmallow's
+        // display pipeline where frames are dropped outside of our control if they land
+        // on the same V-sync.
+        //
+        // Hopefully, we can get rid of this once someone comes up with a better way
+        // to track the state of the pipeline and time frames.
+        int roundedRefreshRate = Math.round(displayRefreshRate);
+        if (!prefConfig.disableFrameDrop || prefConfig.unlockFps) {
+            if (Build.DEVICE.equals("coral") || Build.DEVICE.equals("flame")) {
+                // HACK: Pixel 4 (XL) ignores the preferred display mode and lowers refresh rate,
+                // causing frame pacing issues. See https://issuetracker.google.com/issues/143401475
+                // To work around this, use frame drop mode if we want to stream at >= 60 FPS.
+                if (prefConfig.fps >= 60) {
+                    LimeLog.info("Using Pixel 4 rendering hack");
+                    decoderRenderer.enableLegacyFrameDropRendering();
+                }
+            }
+            else if (prefConfig.fps >= roundedRefreshRate) {
+                if (prefConfig.unlockFps) {
+                    // Use frame drops when rendering above the screen frame rate
+                    decoderRenderer.enableLegacyFrameDropRendering();
+                    LimeLog.info("Using drop mode for FPS > Hz");
+                } else if (roundedRefreshRate <= 49) {
+                    // Let's avoid clearly bogus refresh rates and fall back to legacy rendering
+                    decoderRenderer.enableLegacyFrameDropRendering();
+                    LimeLog.info("Bogus refresh rate: " + roundedRefreshRate);
+                }
+                // HACK: Avoid crashing on some MTK devices
+                else if (decoderRenderer.isBlacklistedForFrameRate(roundedRefreshRate - 1)) {
+                    // Use the old rendering strategy on these broken devices
+                    decoderRenderer.enableLegacyFrameDropRendering();
+                } else {
+                    chosenFrameRate = roundedRefreshRate - 1;
+                    LimeLog.info("Adjusting FPS target for screen to " + chosenFrameRate);
+                }
+            }
+        }
+    }
+
+    private void setStreamViewSize() {
+        if (prefConfig.stretchVideo || aspectRatioMatch) {
+            // Set the surface to the size of the video
+            streamView.getHolder().setFixedSize(prefConfig.width, prefConfig.height);
+        }
+        else {
+            // Set the surface to scale based on the aspect ratio of the stream
+            streamView.setDesiredAspectRatio((double)prefConfig.width / (double)prefConfig.height);
+        }
+    }
+
+    private void initTouchControls() {
+        // Initialize touch contexts
+        for (int i = 0; i < touchContextMap.length; i++) {
+            if (!prefConfig.touchscreenTrackpad) {
+                touchContextMap[i] = new AbsoluteTouchContext(conn, i, streamView);
+            }
+            else {
+                touchContextMap[i] = new RelativeTouchContext(conn, i,
+                        REFERENCE_HORIZ_RES, REFERENCE_VERT_RES,
+                        streamView);
+            }
+        }
+
+        if (prefConfig.onscreenController) {
+            // create virtual onscreen controller
+            virtualController = new VirtualController(controllerHandler,
+                    (FrameLayout)streamView.getParent(),
+                    this);
+            virtualController.refreshLayout();
+            virtualController.show();
+        }
+    }
+
+    private void createDecoderRenderer() {
+        decoderRenderer = new MediaCodecDecoderRenderer(
+                this,
+                prefConfig,
+                new CrashListener() {
+                    @Override
+                    public void notifyCrash(Exception e) {
+                        // The MediaCodec instance is going down due to a crash
+                        // let's tell the user something when they open the app again
+
+                        // We must use commit because the app will crash when we return from this function
+                        tombstonePrefs.edit().putInt("CrashCount", tombstonePrefs.getInt("CrashCount", 0) + 1).commit();
+                        reportedCrash = true;
+                    }
+                },
+                tombstonePrefs.getInt("CrashCount", 0),
+                connMgr.isActiveNetworkMetered(),
+                willStreamHdr,
+                glPrefs.glRenderer,
+                this);
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -229,9 +372,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // Listen for events on the game surface
         streamView = findViewById(R.id.surfaceView);
-        streamView.setOnGenericMotionListener(this);
-        streamView.setOnTouchListener(this);
-        streamView.setInputCallbacks(this);
+        setStreamViewListeners();
 
         notificationOverlayView = findViewById(R.id.notificationOverlay);
 
@@ -239,20 +380,8 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         inputCaptureProvider = InputCaptureManager.getInputCaptureProvider(this, this);
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // The view must be focusable for pointer capture to work.
-            streamView.setFocusable(true);
-            streamView.setDefaultFocusHighlightEnabled(false);
-            streamView.setOnCapturedPointerListener(new View.OnCapturedPointerListener() {
-                @Override
-                public boolean onCapturedPointer(View view, MotionEvent motionEvent) {
-                    return handleMotionEvent(view, motionEvent);
-                }
-            });
-        }
-
         // Warn the user if they're on a metered connection
-        ConnectivityManager connMgr = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        connMgr = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (connMgr.isActiveNetworkMetered()) {
             displayTransientMessage(getResources().getString(R.string.conn_metered));
         }
@@ -275,7 +404,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         String uniqueId = Game.this.getIntent().getStringExtra(EXTRA_UNIQUEID);
         String uuid = Game.this.getIntent().getStringExtra(EXTRA_PC_UUID);
         String pcName = Game.this.getIntent().getStringExtra(EXTRA_PC_NAME);
-        boolean willStreamHdr = Game.this.getIntent().getBooleanExtra(EXTRA_APP_HDR, false);
+        willStreamHdr = Game.this.getIntent().getBooleanExtra(EXTRA_APP_HDR, false);
         byte[] derCertData = Game.this.getIntent().getByteArrayExtra(EXTRA_SERVER_CERT);
 
         X509Certificate serverCert = null;
@@ -305,7 +434,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         // Initialize the MediaCodec helper before creating the decoder
-        GlPreferences glPrefs = GlPreferences.readPreferences(this);
+        glPrefs = GlPreferences.readPreferences(this);
         MediaCodecHelper.initialize(this, glPrefs.glRenderer);
 
         // Check if the user has enabled HDR
@@ -351,25 +480,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             performanceOverlayView.setVisibility(View.VISIBLE);
         }
 
-        decoderRenderer = new MediaCodecDecoderRenderer(
-                this,
-                prefConfig,
-                new CrashListener() {
-                    @Override
-                    public void notifyCrash(Exception e) {
-                        // The MediaCodec instance is going down due to a crash
-                        // let's tell the user something when they open the app again
-
-                        // We must use commit because the app will crash when we return from this function
-                        tombstonePrefs.edit().putInt("CrashCount", tombstonePrefs.getInt("CrashCount", 0) + 1).commit();
-                        reportedCrash = true;
-                    }
-                },
-                tombstonePrefs.getInt("CrashCount", 0),
-                connMgr.isActiveNetworkMetered(),
-                willStreamHdr,
-                glPrefs.glRenderer,
-                this);
+        createDecoderRenderer();
 
         // Don't stream HDR if the decoder can't support it
         if (willStreamHdr && !decoderRenderer.isHevcMain10Hdr10Supported()) {
@@ -395,60 +506,11 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         }
 
         // Set to the optimal mode for streaming
-        float displayRefreshRate = prepareDisplayForRendering();
+        displayRefreshRate = prepareDisplayForRendering();
         LimeLog.info("Display refresh rate: "+displayRefreshRate);
 
-        // HACK: Despite many efforts to ensure low latency consistent frame
-        // delivery, the best non-lossy mechanism is to buffer 1 extra frame
-        // in the output pipeline. Android does some buffering on its end
-        // in SurfaceFlinger and it's difficult (impossible?) to inspect
-        // the precise state of the buffer queue to the screen after we
-        // release a frame for rendering.
-        //
-        // Since buffering a frame adds latency and we are primarily a
-        // latency-optimized client, rather than one designed for picture-perfect
-        // accuracy, we will synthetically induce a negative pressure on the display
-        // output pipeline by driving the decoder input pipeline under the speed
-        // that the display can refresh. This ensures a constant negative pressure
-        // to keep latency down but does induce a periodic frame loss. However, this
-        // periodic frame loss is *way* less than what we'd already get in Marshmallow's
-        // display pipeline where frames are dropped outside of our control if they land
-        // on the same V-sync.
-        //
-        // Hopefully, we can get rid of this once someone comes up with a better way
-        // to track the state of the pipeline and time frames.
-        int roundedRefreshRate = Math.round(displayRefreshRate);
-        int chosenFrameRate = prefConfig.fps;
-        if (!prefConfig.disableFrameDrop || prefConfig.unlockFps) {
-            if (Build.DEVICE.equals("coral") || Build.DEVICE.equals("flame")) {
-                // HACK: Pixel 4 (XL) ignores the preferred display mode and lowers refresh rate,
-                // causing frame pacing issues. See https://issuetracker.google.com/issues/143401475
-                // To work around this, use frame drop mode if we want to stream at >= 60 FPS.
-                if (prefConfig.fps >= 60) {
-                    LimeLog.info("Using Pixel 4 rendering hack");
-                    decoderRenderer.enableLegacyFrameDropRendering();
-                }
-            }
-            else if (prefConfig.fps >= roundedRefreshRate) {
-                if (prefConfig.unlockFps) {
-                    // Use frame drops when rendering above the screen frame rate
-                    decoderRenderer.enableLegacyFrameDropRendering();
-                    LimeLog.info("Using drop mode for FPS > Hz");
-                } else if (roundedRefreshRate <= 49) {
-                    // Let's avoid clearly bogus refresh rates and fall back to legacy rendering
-                    decoderRenderer.enableLegacyFrameDropRendering();
-                    LimeLog.info("Bogus refresh rate: " + roundedRefreshRate);
-                }
-                // HACK: Avoid crashing on some MTK devices
-                else if (decoderRenderer.isBlacklistedForFrameRate(roundedRefreshRate - 1)) {
-                    // Use the old rendering strategy on these broken devices
-                    decoderRenderer.enableLegacyFrameDropRendering();
-                } else {
-                    chosenFrameRate = roundedRefreshRate - 1;
-                    LimeLog.info("Adjusting FPS target for screen to " + chosenFrameRate);
-                }
-            }
-        }
+        chosenFrameRate = prefConfig.fps;
+        setDecoderFrameDropRendering();
 
         boolean vpnActive = NetHelper.isActiveNetworkVpn(this);
         if (vpnActive) {
@@ -482,31 +544,12 @@ public class Game extends Activity implements SurfaceHolder.Callback,
         InputManager inputManager = (InputManager) getSystemService(Context.INPUT_SERVICE);
         inputManager.registerInputDeviceListener(controllerHandler, null);
 
-        // Initialize touch contexts
-        for (int i = 0; i < touchContextMap.length; i++) {
-            if (!prefConfig.touchscreenTrackpad) {
-                touchContextMap[i] = new AbsoluteTouchContext(conn, i, streamView);
-            }
-            else {
-                touchContextMap[i] = new RelativeTouchContext(conn, i,
-                        REFERENCE_HORIZ_RES, REFERENCE_VERT_RES,
-                        streamView);
-            }
-        }
+        initTouchControls();
 
         // Use sustained performance mode on N+ to ensure consistent
         // CPU availability
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             getWindow().setSustainedPerformanceMode(true);
-        }
-
-        if (prefConfig.onscreenController) {
-            // create virtual onscreen controller
-            virtualController = new VirtualController(controllerHandler,
-                    (FrameLayout)streamView.getParent(),
-                    this);
-            virtualController.refreshLayout();
-            virtualController.show();
         }
 
         if (prefConfig.usbDriver) {
@@ -726,7 +769,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
         // From 4.4 to 5.1 we can't ask for a 4K display mode, so we'll
         // need to hint the OS to provide one.
-        boolean aspectRatioMatch = false;
+        aspectRatioMatch = false;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT &&
                 Build.VERSION.SDK_INT <= Build.VERSION_CODES.LOLLIPOP_MR1) {
             // On KitKat and later (where we can use the whole screen via immersive mode), we'll
@@ -746,14 +789,7 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             }
         }
 
-        if (prefConfig.stretchVideo || aspectRatioMatch) {
-            // Set the surface to the size of the video
-            streamView.getHolder().setFixedSize(prefConfig.width, prefConfig.height);
-        }
-        else {
-            // Set the surface to scale based on the aspect ratio of the stream
-            streamView.setDesiredAspectRatio((double)prefConfig.width / (double)prefConfig.height);
-        }
+        setStreamViewSize();
 
         if (getPackageManager().hasSystemFeature(PackageManager.FEATURE_TELEVISION) ||
                 getPackageManager().hasSystemFeature(PackageManager.FEATURE_LEANBACK)) {
@@ -1347,6 +1383,21 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                     return true;
                 }
 
+                if (event.getActionMasked() == MotionEvent.ACTION_POINTER_DOWN &&
+                        event.getPointerCount() == 4) {
+                    // Four fingers down
+                    threeFingerDownTime = 0;
+                    fourFingerDownTime = SystemClock.uptimeMillis();
+
+                    // Cancel the first and second touches to avoid
+                    // erroneous events
+                    for (TouchContext aTouchContext : touchContextMap) {
+                        aTouchContext.cancelTouch();
+                    }
+
+                    return true;
+                }
+
                 TouchContext context = getTouchContext(actionIndex);
                 if (context == null) {
                     return false;
@@ -1368,6 +1419,38 @@ public class Game extends Activity implements SurfaceHolder.Callback,
                         if (SystemClock.uptimeMillis() - threeFingerDownTime < THREE_FINGER_TAP_THRESHOLD) {
                             // This is a 3 finger tap to bring up the keyboard
                             showKeyboard();
+                            return true;
+                        }
+                        long fourTime = SystemClock.uptimeMillis() - fourFingerDownTime;
+                        if (fourTime > FOUR_FINGER_HOLD_MIN && fourTime < FOUR_FINGER_HOLD_MAX) {
+                            // This is a 4 finger long press to toggle the display/audio
+                            if (streamingToggled) {
+                                streamingToggled = false;
+                                turningOffStream = true;
+                                conn.stop();
+                                conn.start(null, null, Game.this);
+                                turningOffStream = false;
+                                Canvas c = streamView.getHolder().lockCanvas();
+                                c.drawColor(Color.BLACK);
+                                streamView.getHolder().unlockCanvasAndPost(c);
+                                Toast.makeText(this, "Stopped Video/Audio Streams", Toast.LENGTH_LONG).show();
+                            } else {
+                                streamingToggled = true;
+                                turningOffStream = true;
+                                conn.stop();
+                                streamView.removeCallbacks(null);
+                                ViewGroup streamParent = (ViewGroup)streamView.getParent();
+                                streamParent.removeView(streamView);
+                                streamView = new StreamView(this);
+                                setStreamViewListeners();
+                                createDecoderRenderer();
+                                setStreamViewSize();
+                                setDecoderFrameDropRendering();
+                                initTouchControls();
+                                streamView.getHolder().addCallback(this);
+                                streamParent.addView(streamView);
+                                Toast.makeText(this, "Starting Video/Audio Streams", Toast.LENGTH_LONG).show();
+                            }
                             return true;
                         }
                     }
@@ -1717,13 +1800,13 @@ public class Game extends Activity implements SurfaceHolder.Callback,
 
             decoderRenderer.setRenderTarget(holder);
             conn.start(PlatformBinding.getAudioRenderer(), decoderRenderer, Game.this);
+            turningOffStream = false;
         }
     }
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
         surfaceCreated = true;
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             // Tell the OS about our frame rate to allow it to adapt the display refresh rate appropriately
             holder.getSurface().setFrameRate(prefConfig.fps, Surface.FRAME_RATE_COMPATIBILITY_FIXED_SOURCE);
@@ -1740,8 +1823,10 @@ public class Game extends Activity implements SurfaceHolder.Callback,
             // Let the decoder know immediately that the surface is gone
             decoderRenderer.prepareForStop();
 
-            if (connected) {
+            if (connected && !turningOffStream) {
                 stopConnection();
+            } else {
+                attemptedConnection = false;
             }
         }
     }

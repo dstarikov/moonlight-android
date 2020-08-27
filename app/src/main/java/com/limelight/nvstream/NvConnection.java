@@ -222,7 +222,11 @@ public class NvConnection {
         new Thread(new Runnable() {
             public void run() {
                 context.connListener = connectionListener;
-                context.videoCapabilities = videoDecoderRenderer.getCapabilities();
+                if (videoDecoderRenderer == null) {
+                    context.videoCapabilities = -1;
+                } else {
+                    context.videoCapabilities = videoDecoderRenderer.getCapabilities();
+                }
 
                 String appName = context.streamConfig.getApp().getAppName();
 
